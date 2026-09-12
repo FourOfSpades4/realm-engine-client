@@ -5,6 +5,16 @@ import { warnUnimplemented } from '../stubWarn.js';
 import { Logger } from '../../../util/Logger.js';
 import type { MovementController } from '../movement/MovementController.js';
 
+// ─── Server-driven teleport cooldown ─────────────────────────────────────────
+// The server answers a TELEPORT with GOTO (it moved us) or NOTIFICATION (it
+// refused); StateManager watches that pair and records when teleporting is
+// allowed again on the connection. This reads that state — no message text, no
+// dependence on the server's wording or language.
+function teleportCooldownRemainingMs(deps: BridgeDeps): number {
+  const until = deps.clientRef.current?.teleportBlockedUntil ?? 0;
+  return Math.max(0, until - Date.now());
+}
+
 export class BridgeWalking {
   static install(deps: BridgeDeps, movement: MovementController): void {
     Walking.walkTo = (x, y) => {
@@ -100,14 +110,23 @@ export class BridgeWalking {
     };
 
     Walking.canTeleport = (): boolean => {
+      if (teleportCooldownRemainingMs(deps) > 0) return false;
       return deps.clientRef.current?.playerData.teleportAllowed ?? false;
     };
+
+    Walking.teleportCooldownRemainingMs = (): number => teleportCooldownRemainingMs(deps);
 
     Walking.teleportToPlayer = (name: string): boolean => {
       const c = deps.clientRef.current;
       if (!c?.connected) return false;
       if (!c.playerData.teleportAllowed) {
         Logger.warn('Walking', 'teleportToPlayer: teleport not allowed in this map');
+        return false;
+      }
+      const cooldownMs = teleportCooldownRemainingMs(deps);
+      if (cooldownMs > 0) {
+        // Do NOT send: the server already refused and is counting down.
+        Logger.warn('Walking', `teleportToPlayer: server cooldown, ${(cooldownMs / 1000).toFixed(1)}s remaining`);
         return false;
       }
       const q = name.trim().toLowerCase();
@@ -123,11 +142,14 @@ export class BridgeWalking {
         pkt.data.objectId = row.objectId;
         pkt.modified = true;
         c.sendToServer(pkt);
-        return true;
       } catch (err) {
         Logger.warn('Walking', `teleportToPlayer: send failed — ${(err as Error).message}`);
         return false;
       }
+      // sendToServer bypasses the packet hooks — tell StateManager directly so
+      // it can match the server's GOTO / NOTIFICATION answer to this TELEPORT.
+      deps.stateManager.noteTeleportSent(c, row.objectId);
+      return true;
     };
 
     Walking.teleportToBeacon = (objectId: number): boolean => {
@@ -137,16 +159,25 @@ export class BridgeWalking {
         Logger.warn('Walking', 'teleportToBeacon: teleport not allowed in this map');
         return false;
       }
+      const cooldownMs = teleportCooldownRemainingMs(deps);
+      if (cooldownMs > 0) {
+        // Do NOT send: the server already refused and is counting down.
+        Logger.warn('Walking', `teleportToBeacon: server cooldown, ${(cooldownMs / 1000).toFixed(1)}s remaining`);
+        return false;
+      }
       try {
         const pkt = deps.proxy.packetFactory.createByName('TELEPORT');
         pkt.data.objectId = objectId;
         pkt.modified = true;
         c.sendToServer(pkt);
-        return true;
       } catch (err) {
         Logger.warn('Walking', `teleportToBeacon: send failed — ${(err as Error).message}`);
         return false;
       }
+      // sendToServer bypasses the packet hooks — tell StateManager directly so
+      // it can match the server's GOTO / NOTIFICATION answer to this TELEPORT.
+      deps.stateManager.noteTeleportSent(c, objectId);
+      return true;
     };
   }
 }
